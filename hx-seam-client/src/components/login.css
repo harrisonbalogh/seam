@@ -1,0 +1,92 @@
+
+#login {
+    background-color: lightgray;
+    bottom: 0;
+    left: 0;
+    position: absolute;
+    right: 0;
+    top: 0;
+  }
+  
+  #login>div {
+    background-color: var(--color-foreground);
+    border: 0 solid var(--color-background);
+    border-width: 10px 0;
+    box-shadow: 0 0 10px 5px gray;
+    margin: 0;
+    padding: 10px 0;
+    position: absolute;
+    top: 50%;
+    -ms-transform: translateY(-50%);
+    text-align: center;
+    transform: translateY(-50%);
+    width: 100%;
+  }
+  
+  .logo {
+    /* background: url('../../images/webIcon@2x.png') no-repeat center/contain; */
+    display: inline-block;
+    height: 40px;
+    margin: 0;
+    padding: 20px 0;
+    width: 40px;
+  }
+  
+  .txt {
+    display: block;
+    margin: 6px auto;
+    border: 1px solid var(--color-background);
+    padding: 4px;
+  }
+  
+  .txt:disabled {
+    background-color: lightgray;
+  }
+  
+  .submit {
+    background-color: var(--color-background);
+    border: 1px solid var(--color-background);
+    border-radius: 4px;
+    color: var(--color-foreground);
+    cursor: pointer;
+    font-weight: bold;
+    display: block;
+    margin: 24px auto;
+    padding: 5px 9px;
+  }
+  
+  .submit:hover {
+    background-color: var(--color-foreground);
+    color: var(--color-background);
+  }
+  .submit:active {
+    background-color: lightgray;
+  }
+  
+  .submit:disabled {
+    background-color: var(--color-foreground);
+    color: var(--color-background);
+    cursor: default;
+  }
+  .submit:disabled:hover {
+    background-color: var(--color-foreground);
+    color: var(--color-background);
+  }
+  
+  /* #login input {
+    border-bottom: 1px solid var(--color-background);
+    margin: 0 auto 30px auto;
+    max-width: 240px;
+    padding: 0;
+    text-align: left;
+  }
+  #login p input {
+    border: 0px;
+    background-color: transparent;
+    font-size: 14px;
+    text-align: left;
+    width: 100%;
+  }
+  #login p input:focus {
+    outline: none;
+  } */
