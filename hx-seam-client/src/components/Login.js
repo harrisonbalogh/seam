@@ -39,6 +39,12 @@ class Login extends React.Component {
     })
   }
 
+  handlePasswordKeyPress(e) {
+    if(e.key === 'Enter'){
+      this.handleSubmit()
+    }
+  }
+
   render() {
     const { user, pwd, loggingIn } = this.state
 
@@ -47,7 +53,7 @@ class Login extends React.Component {
         <div>
           <div className='logo'/>
           <input disabled={loggingIn} className='txt user' placeholder='User' type='text' value={user} onChange={this.handleUserInput} />
-          <input disabled={loggingIn} className='txt pwd' placeholder='Password' type='password' value={pwd} onChange={this.handlePasswordInput} />
+          <input disabled={loggingIn} className='txt pwd' placeholder='Password' type='password' value={pwd} onChange={this.handlePasswordInput} onKeyPress={(e) => this.handlePasswordKeyPress(e)}/>
           <button disabled={loggingIn} className='submit' onClick={this.handleSubmit}>{loggingIn ? 'Logging in...' : 'Login'}</button>
         </div>
       </div>
