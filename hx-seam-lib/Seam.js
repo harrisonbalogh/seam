@@ -18,7 +18,8 @@ export const STATUS = {
     Sent: "SENT",
     Rejected: "REJECTED",
     Accepted: "ACCEPTED",
-    Error: "ERROR"
+    Error: "ERROR",
+    StableChat: "CHAT_STABLE"
 }
 
 /** {guid: Set} - Existing requests to peers */
@@ -35,11 +36,11 @@ const connections = {}
  * @returns True if request from given GUID is active.
  */
 export const hasRequest = (guid, type) => {
-    return requests[guid] && (type === undefined || requests[guid].has(type))
+    return requests[guid] && requests[guid]
 }
 /** Checks if the given connection type has been sent to a peer, by GUID. */
 export const hasRequested = (guid, type) => {
-    return connections[guid] && (type === undefined || connections[guid].actions[type] !== undefined)
+    return connections[guid] && requested[guid]
 }
 /** Checks if the given connection type has been sent to a peer, by GUID. */
 export const hasConnection = (guid) => {
@@ -54,7 +55,7 @@ class Connection {
     constructor(guid, statusCallback = () => {}) {
         this.rtc = new RTCPeerConnection(ICE_CONFIGURATION)
         this.rtc.onicecandidate = (event) => {
-            if (!event.candidate) return
+            if (this.rtc.signalingState != "stable" || !event.candidate) return
             // TODO: Check if label and id need to be read from sending client
             relay(guid, {
                 type: 'candidate',
@@ -72,7 +73,9 @@ class Connection {
                   break
               }
         }
-        this.rtc.onicegatheringstatechange = _ => {} // Notify?
+        this.rtc.onicegatheringstatechange = _ => {
+            // Notify?
+        }
         this.rtc.onsignalingstatechange = () => {
             switch(this.rtc.signalingState) {
                 case "closed":
@@ -93,37 +96,166 @@ class Connection {
             'offer': (d) => this.handleOffer(d),
             'answer': (d) => this.handleAnswer(d),
             'candidate': (d) => this.handleCandidate(d),
-            'closed': () => this.handleClosed()
+            'closed': () => this.handleClosed(),
+            'chatMessage': () => {}
         }
         this.export = {
-            guid: function() {return this.guid},
+            guid: () => this.guid,
             fileShare: _ => {},
             chatMessage: _ => {},
             callStart: _ => {},
-            callEnd: _ => {}
+            callEnd: _ => {},
+            setHandleChatMessage: callback => this.messageHandler['chatMessage'] = callback
         }
+    }
+
+    async sendOffer() {
+        // Create chat by default. For requesting peer
+        let chatChannel = this.rtc.createDataChannel("chatChannel");
+        chatChannel.onopen = () => this.statusCallback(STATUS.StableChat)
+        chatChannel.onclose = () => {}
+        chatChannel.onmessage = m => this.messageHandler['chatMessage'](m.data);
+        this.export.chatMessage = m => chatChannel.send(m)
+
+        await this.rtc.setLocalDescription(await this.rtc.createOffer())
+        this.statusCallback(STATUS.Requested)
+        this.send(this.rtc.localDescription) // RTCSessionDescription has type built in (answer/offer)
+    }
+
+    async sendAnswer(data) {
+        // Setup chat by default. For receiving peer
+        this.rtc.ondatachannel = evt => {
+            evt.channel.onmessage = m => this.messageHandler['chatMessage'](m.data);
+            this.export.chatMessage = m => evt.channel.send(m)
+            evt.channel.onopen = this.statusCallback(STATUS.StableChat)
+            evt.channel.onclose = () => {}
+        }
+
+        await this.rtc.setRemoteDescription(new RTCSessionDescription(data))
+        await this.rtc.setLocalDescription(await this.rtc.createAnswer())
+        this.send(this.rtc.localDescription) // RTCSessionDescription has type built in (answer)
+        this.statusCallback(STATUS.Accepted)
     }
 
     async handleOffer(data) {
         if (hasRequested(data.source)) {
             delete requested[data.source]
         } else {
-            requests[data.source] = new Set("something")
+            requests[data.source] = data
             notifyRequest(data.source)
+            return
         }
-        await this.rtc.setRemoteDescription(new RTCSessionDescription(data))
-        await this.rtc.setLocalDescription(await this.rtc.createAnswer())
-        console.log(`Offer from ${data.source}`)
-        this.send(this.rtc.localDescription) // RTCSessionDescription has type built in (answer)
+
+        await this.sendAnswer(data)
     }
 
     handleAnswer(data) {
         this.rtc.setRemoteDescription(new RTCSessionDescription(data))
-        console.log(`Answer from ${data.source}`)
+
+        return
+
+        // For call receiver:
+        peerConnection.ontrack = track => {
+            // htmlVideoDisplay.srcObject = track.streams[0]
+        }
+
+        // For call requester (and receiver?):
+        // dataStream = await navigator.mediaDevices.getUserMedia({
+        //     audio: true,
+        //     video: true
+        // })
+        dataStream.getTracks().forEach(track => {
+            this.rtc.addTrack(track, dataStream)
+        })
+        // Stop tracks:
+        // dataStream.getTracks().forEach(track => track.stop())
+
+        // For file receiver:
+        this.rtc.ondatachannel = event => {
+			dataChannel = event.channel;
+			dataChannel.binaryType = "arraybuffer";
+
+            dataChannel.onopen = () => {
+                let fileReader = new FileReader();
+                fileOffset = 0;
+                fileStartTime = new Date();
+                fileReader.addEventListener("error", err => console.error("Error reading file:", err));
+                fileReader.addEventListener("abort", evt => console.log("File reading aborted:", evt));
+                fileReader.addEventListener("load", async e => {
+                    dataChannel.send(e.target.result);
+                    let progress = `${roundTo(((fileOffset/fileSelected.size)*100), 2)}% sent.`
+                    fileOffset += e.target.result.byteLength;
+                    if (dataChannel.bufferedAmount < 65535) {
+                        if (fileOffset < fileSelected.size) {
+                            fileReader.readAsArrayBuffer(fileSelected.slice(fileOffset, fileOffset + 16384))
+                        } else {
+                            if (fileSelectedQueue.length > 0) {
+                                fileOffset = 0;
+                                let next = fileSelectedQueue[0];
+                                fileSelectedQueue.splice(0,1);
+                                setFileSelected(next);
+                            }
+                            console.log("File transfer completion time: " + ((new Date() - fileStartTime)/1000) + " seconds");
+
+                        }
+                    }
+                });
+                fileLabel.innerHTML = "Sending";
+                fileReader.readAsArrayBuffer(fileSelected.slice(fileOffset, 16384))
+            }
+
+            dataChannel.onclose = () => {}
+		};
+
+        // For file requester:
+        this.rtc.ondatachannel = event => {
+			dataChannel = event.channel;
+			dataChannel.binaryType = "arraybuffer";
+            dataChannel.bufferedAmountLowThreshold = 65535;
+            dataChannel.onbufferedamountlow = () => fileReader.readAsArrayBuffer(fileSelected.slice(fileOffset, fileOffset + 16384));
+		};
+        dataChannel.onmessage = function(event) {
+            fileInboundBuffer.push(event.data);
+            fileInboundSize += event.data.byteLength;
+
+            // receiveProgress.value = receivedSize; clip: rect(0, 0, 38px, 0);
+              let ratio = (fileInboundSize/fileReceiveSize);
+              fileProgressReceive.style.clip = "rect(0, "+(280*ratio)+"px, 38px, 0)"
+              fileInboundLabel.innerHTML = roundTo(ratio*100, 2)+"% received.";
+
+            // we are assuming that our signaling protocol told
+            // about the expected file size (and name, hash, etc).
+            if (fileInboundSize === fileReceiveSize) {
+              const received = new Blob(fileInboundBuffer);
+              fileInboundBuffer = [];
+                  fileInboundSize = 0;
+
+                  actionContainers[ACTION_FILE].style.height = "38px";
+
+                  let url = URL.createObjectURL(received);
+                  let a = document.createElement("a");
+                  a.style.display = "none";
+                  document.body.appendChild(a);
+                  a.href = url;
+                  a.download = fileReceiveName;
+                  fileReceiveName = "";
+                  a.click();
+                  URL.revokeObjectURL(url);
+                  document.body.removeChild(a);
+
+                  if (fileReceieveQueue == 0) {
+                      console.log("Finished queue.");
+                      dataChannel.close();
+                  } else {
+                      console.log("Awaiting next queue item...");
+                      sendWebRTCSignal({type: "meta"});
+                  }
+            }
+
+          }
     }
 
     handleCandidate(data) {
-        console.log(`Candidate from ${data.source}`)
         let candidate;
         try {
             // TODO - review: it's possible for signal.candidate to be null? https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/addIceCandidate
@@ -162,24 +294,18 @@ class Connection {
  */
 export async function connect(guid, statusCallback) {
     if (!isRelayConnected()) return statusCallback(STATUS.Error)
+    if (!hasConnection(guid)) connections[guid] = new Connection(guid, statusCallback)
 
-    if (hasRequest(guid) && hasConnection(guid)) {
-        delete requests[guid] // Pop from requests
-        let peerConnection = connections[guid].rtc
+    // TODO - hasRequest system to be replaced with "perfectNegotiation" design
+    if (hasRequest(guid)) {
+        let offer = requests[guid]
+        delete requests[guid]
         connections[guid].statusCallback = statusCallback
-        await peerConnection.setRemoteDescription(new RTCSessionDescription(data))
-        await peerConnection.setLocalDescription(await peerConnection.createAnswer())
-        statusCallback(STATUS.Accepted)
+        await connections[guid].sendAnswer(offer)
     } else {
-        let connection = new Connection(guid, statusCallback)
-        let peerConnection = connection.rtc
-        connections[guid] = connection // Map this peer GUID to this connection
-        requested[guid] = new Set("call") // TODO: enumerate // Push to requested
-        await peerConnection.setLocalDescription(await peerConnection.createOffer())
-        statusCallback(STATUS.Requested)
+        requested[guid] = new Set("chat") // TODO: enumerate // Push to requested
+        await connections[guid].sendOffer()
     }
-
-    connections[guid].send(connections[guid].rtc.localDescription) // RTCSessionDescription has type built in (answer/offer)
     return connections[guid].export
 }
 
@@ -188,8 +314,6 @@ export async function connect(guid, statusCallback) {
  * @param {{source: GUID, type: String, data: {*}}} message - From peer through relay server.
  */
 export function handleRelay(message) {
-    console.log(`New Message.`)
-    console.log(message)
     let target = message.source
     if (!hasConnection(target)) {
         connections[target] = new Connection(target)
@@ -197,7 +321,6 @@ export function handleRelay(message) {
     message.type = message.data.type
     let messageHandler = connections[target].messageHandler[message.type]
     if (typeof messageHandler !== 'function') {
-        console.log(`Ignoring unhandled peer message of type: ${message.type}`)
         return
     }
     message.data.source = message.source
