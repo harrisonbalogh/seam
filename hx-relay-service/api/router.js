@@ -4,9 +4,12 @@ const jwt = require('jsonwebtoken'),
       fs = require('fs'),
       // secret = JSON.parse(fs.readFileSync("key.json")).secret,
       WebSocketServer = require('ws').Server,
+      domain = require("../config.js").domain;
       HXAuthServiceClient = require('./HXAuthServiceClient');
 
 const verifyClient = (info, verified) => {
+  if (domain == "localhost") return verified(true)
+
   if (info.req.headers.cookie === undefined) {
     console.log("No JWT.")
     return verified(false, 403, 'No token provided')

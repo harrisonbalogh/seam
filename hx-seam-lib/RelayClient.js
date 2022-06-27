@@ -78,6 +78,7 @@ export function connect(onConnect, onError = () => {}) {
 export function disconnect() {
     serverSocket.close()
     serverSocket = undefined
+    guid = undefined
     // TODO - Validate handlerOnClose is called from serverSocket.close()
 }
 

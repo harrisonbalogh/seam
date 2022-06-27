@@ -4,7 +4,7 @@
   "private": true,
   "dependencies": {
     "hx-seam-lib": "file:../hx-seam-lib",
-    "hx-session-manager": "file:../../../HXSessionManager",
+    "hx-session-manager": "file:../../../../HXAuth/hx-session-manager-lib",
     "@testing-library/jest-dom": "^5.16.2",
     "@testing-library/react": "^12.1.2",
     "@testing-library/user-event": "^13.5.0",

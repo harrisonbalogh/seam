@@ -5,10 +5,7 @@
  * Author: Harrison Balogh (First version: 2022)
  */
 import { relay, isConnected as isRelayConnected  } from './RelayClient'
-import { STUN_SERVER_URL } from './Constants'
-
-/** ICE configuration. Alternative: 'stun:stun.sipgate.net:3478' */
-const ICE_CONFIGURATION = {iceServers: [{urls: STUN_SERVER_URL}]}
+import * as RTCHelper from './RTCHelper'
 
 /** Status callback states. */
 export const STATUS = {
@@ -21,154 +18,180 @@ export const STATUS = {
     Error: "ERROR",
     StableChat: "CHAT_STABLE"
 }
+const CONNECTION_STATE = {
+    Accepted: "ACCEPTED",
+    Requested: "REQUESTED",
+    Unset: "UNSET"
+}
+const CONNECTION_STATE_DEFAULT = {
+    chat: undefined,
+    call: undefined,
+    file: {}
+}
 
-/** {guid: Set} - Existing requests to peers */
-const requests = {}
-/** {guid: Set} - Existing requests from peers */
-const requested = {}
-/** // {guid: Connection prototype} */
-const connections = {}
+export const CHANNEL_TYPE = {
+    Chat: "CHAT",
+    Call: "CALL",
+    File: "FILE"
+}
 
-/**
- * Checks if the given peer, by GUID, has requested the given connection type.
- * @param {*} guid - Peer GUID assigned by Relay service.
- * @param {*} type - Optional. Omit to check for any request type.
- * @returns True if request from given GUID is active.
+/** Incoming peer connection-state requests. Map peer GUID to:
+ *    hxDescriptor - Set() of enumerated readable channels in SDP.
+ *    rtcDescriptor - RTCSessionDescription for remote RTC description setter.
  */
-export const hasRequest = (guid, type) => {
-    return requests[guid] && requests[guid]
-}
+export const requests = { /** {guid: {hxDescriptor: Set, rtcDescriptor: RTCSessionDescription}} */ }
+export const hasRequest = (guid, descriptor) => requests[guid] && (descriptor === undefined || RTCHelper.eqSet(requests[guid].hxDescriptor, descriptor))
+/** Outgoing client connection-state requests. Map peer GUID to:
+ *    hxDescriptor - Set() of enumerated readable channels in SDP.
+ *    rtcDescriptor - RTCSessionDescription for local RTC description setter.
+ */
+const requested = { /** {guid: {hxDescriptor: Set, rtcDescriptor: RTCSessionDescription}} */ }
+
+/** Maps RelayService GUIDs to Connection prototype objects */
+const connections = { /** {guid: Connection prototype} */ }
 /** Checks if the given connection type has been sent to a peer, by GUID. */
-export const hasRequested = (guid, type) => {
-    return connections[guid] && requested[guid]
-}
-/** Checks if the given connection type has been sent to a peer, by GUID. */
-export const hasConnection = (guid) => {
+const hasConnection = (guid) => connections[guid] !== undefined
+/** Returns existing connection by GUID if it exists, else a new Connection. */
+const getConnection = (guid, statusCallback = () => {}) => {
+    if (hasConnection(guid)) return connections[guid]
+    connections[guid] = new Connection(guid, statusCallback)
     return connections[guid]
 }
 
 /**
- * Connection prototype. Holds RTC object, client GUID, and various
- * RTC helper fuinctions.
+ * Connection prototype. Holds RTC object, client GUID.
 */
 class Connection {
     constructor(guid, statusCallback = () => {}) {
-        this.rtc = new RTCPeerConnection(ICE_CONFIGURATION)
-        this.rtc.onicecandidate = (event) => {
-            if (this.rtc.signalingState != "stable" || !event.candidate) return
-            // TODO: Check if label and id need to be read from sending client
-            relay(guid, {
-                type: 'candidate',
-                label: event.candidate.sdpMLineIndex,
-                id: event.candidate.sdpMid,
-                candidate: event.candidate
-            })
-        }
-        this.rtc.oniceconnectionstatechange = _ => {
-            switch(this.rtc.iceConnectionState) {
-                case "closed":
-                case "failed":
-                case "disconnected":
-                  this.close()
-                  break
-              }
-        }
-        this.rtc.onicegatheringstatechange = _ => {
-            // Notify?
-        }
-        this.rtc.onsignalingstatechange = () => {
-            switch(this.rtc.signalingState) {
-                case "closed":
-                  this.close()
-                  break
-              }
-        }
-        this.rtc.onnegotiationneeded = async () => {
-            const offer = await this.rtc.createOffer()
-            if (this.rtc.signalingState != "stable") return // Waits for next negotiation
-            await this.rtc.setLocalDescription(offer)
-            this.send(this.rtc.localDescription)
+
+        /// What channel types this connection has approved
+        this.acceptedChannels = new Set()
+        this.clearAcceptedChannels = () => this.acceptedChannels = new Set()
+
+        /// Peer's latest protocol description offer (SDP)
+        this.offer = undefined
+
+        /// WebRTC object with ICE callback suite setup
+        this.rtc = RTCHelper.initRtc(this)
+        /// RelayService-assigned identifier
+        this.guid = guid
+        /// For Connection reference holders event reactions. See `Seam.STATUS`
+        this.statusCallback = statusCallback
+
+        this.messageHandler = {
+            'offer': (a, b, c) => this.handleOffer(a, b, c),
+            'answer': (a) => this.handleAnswer(a),
+            'candidate': (a) => this.handleCandidate(a),
+            'closed': () => this.handleClosed(),
+            chatMessage: () => {},
+            callTrack: () => {}
         }
 
-        this.guid = guid
-        this.statusCallback = statusCallback
-        this.messageHandler = {
-            'offer': (d) => this.handleOffer(d),
-            'answer': (d) => this.handleAnswer(d),
-            'candidate': (d) => this.handleCandidate(d),
-            'closed': () => this.handleClosed(),
-            'chatMessage': () => {}
-        }
+        /** Functions exposed to Connection reference holders */
         this.export = {
             guid: () => this.guid,
             fileShare: _ => {},
             chatMessage: _ => {},
-            callStart: _ => {},
-            callEnd: _ => {},
-            setHandleChatMessage: callback => this.messageHandler['chatMessage'] = callback
+            acceptedChannels: () => this.acceptedChannels,
+            callStart: async onCallTrack => {
+                this.messageHandler.callTrack = onCallTrack
+                this.acceptedChannels.add(CHANNEL_TYPE.Call)
+                // Check if connection request already exists
+                if (hasRequest(guid, this.acceptedChannels)) {
+                    delete requests[guid]
+                }
+                await this.createChannel(CHANNEL_TYPE.Call)
+            },
+            callEnd: _ => {
+                if (this.streams.call) this.streams.call.getTracks().forEach(track => track.stop())
+            },
+            setHandleChatMessage: callback => this.messageHandler.chatMessage = callback,
+            isStable: _ => this.rtc.signalingState == "stable"
+        }
+        this.channels = {
+            chat: undefined
+        }
+        this.streams = {
+            call: undefined
+        }
+    }
+
+    async createChannel(type = CHANNEL_TYPE.Chat) {
+        if (type == CHANNEL_TYPE.Chat) {
+            if (this.channels.chat) this.channels.chat.close()
+
+            this.channels.chat = this.rtc.createDataChannel("chatChannel");
+            this.channels.chat.onopen = () => this.statusCallback(STATUS.StableChat)
+            this.channels.chat.onclose = () => {}
+            this.channels.chat.onmessage = m => this.messageHandler.chatMessage(m.data);
+            this.export.chatMessage = m => this.channels.chat.send(m)
+
+            this.acceptedChannels.add(CHANNEL_TYPE.Chat)
+        } else
+        if (type == CHANNEL_TYPE.Call) {
+            if (this.streams.call) this.streams.call.getTracks().forEach(track => track.stop())
+
+            this.streams.call = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: true
+            })
+
+            this.streams.call.getTracks().forEach(track => {
+                this.rtc.addTrack(track, this.streams.call)
+            })
+            this.rtc.ontrack = track => {
+                this.messageHandler.callTrack(track.streams[0])
+            }
+            this.acceptedChannels.add(CHANNEL_TYPE.Call)
         }
     }
 
     async sendOffer() {
-        // Create chat by default. For requesting peer
-        let chatChannel = this.rtc.createDataChannel("chatChannel");
-        chatChannel.onopen = () => this.statusCallback(STATUS.StableChat)
-        chatChannel.onclose = () => {}
-        chatChannel.onmessage = m => this.messageHandler['chatMessage'](m.data);
-        this.export.chatMessage = m => chatChannel.send(m)
-
-        await this.rtc.setLocalDescription(await this.rtc.createOffer())
+        const offer = await this.rtc.createOffer()
+        if (this.rtc.signalingState != "stable") return // Waits for next negotiation
+        await this.rtc.setLocalDescription(offer) // RTCSessionDescription has type built in (answer/offer)
+        this.send(this.rtc.localDescription)
         this.statusCallback(STATUS.Requested)
-        this.send(this.rtc.localDescription) // RTCSessionDescription has type built in (answer/offer)
     }
 
-    async sendAnswer(data) {
-        // Setup chat by default. For receiving peer
-        this.rtc.ondatachannel = evt => {
-            evt.channel.onmessage = m => this.messageHandler['chatMessage'](m.data);
-            this.export.chatMessage = m => evt.channel.send(m)
-            evt.channel.onopen = this.statusCallback(STATUS.StableChat)
-            evt.channel.onclose = () => {}
+    async sendAnswer(descriptor) {
+        if (this.acceptedChannels.has(CHANNEL_TYPE.Chat)) {
+            this.rtc.ondatachannel = evt => {
+                if (evt.channel.label != "chatChannel") return
+
+                evt.channel.onopen = () => this.statusCallback(STATUS.StableChat)
+                evt.channel.onclose = () => {}
+                evt.channel.onmessage = m => this.messageHandler.chatMessage(m.data);
+                this.export.chatMessage = m => evt.channel.send(m)
+            }
+        }
+        if (this.acceptedChannels.has(CHANNEL_TYPE.Call)) {
+            this.rtc.ontrack = track => {
+                this.messageHandler.callTrack(track.streams[0])
+            }
         }
 
-        await this.rtc.setRemoteDescription(new RTCSessionDescription(data))
+        await this.rtc.setRemoteDescription(new RTCSessionDescription(descriptor))
         await this.rtc.setLocalDescription(await this.rtc.createAnswer())
         this.send(this.rtc.localDescription) // RTCSessionDescription has type built in (answer)
         this.statusCallback(STATUS.Accepted)
     }
 
-    async handleOffer(data) {
-        if (hasRequested(data.source)) {
-            delete requested[data.source]
+    async handleOffer(rtcDescriptor, hxDescriptor, peer) {
+        // Check if this offer type is already approved
+        if (RTCHelper.eqSet(this.acceptedChannels, hxDescriptor)) {
+            await this.sendAnswer(rtcDescriptor)
         } else {
-            requests[data.source] = data
-            notifyRequest(data.source)
-            return
+            requests[peer] = {hxDescriptor, rtcDescriptor}
+            notifyRequest(peer, hxDescriptor)
         }
-
-        await this.sendAnswer(data)
     }
 
-    handleAnswer(data) {
-        this.rtc.setRemoteDescription(new RTCSessionDescription(data))
+    handleAnswer(rtcDescriptor) {
+        // TODO - verify hxDesciptor here?
+        this.rtc.setRemoteDescription(new RTCSessionDescription(rtcDescriptor))
 
         return
-
-        // For call receiver:
-        peerConnection.ontrack = track => {
-            // htmlVideoDisplay.srcObject = track.streams[0]
-        }
-
-        // For call requester (and receiver?):
-        // dataStream = await navigator.mediaDevices.getUserMedia({
-        //     audio: true,
-        //     video: true
-        // })
-        dataStream.getTracks().forEach(track => {
-            this.rtc.addTrack(track, dataStream)
-        })
-        // Stop tracks:
-        // dataStream.getTracks().forEach(track => track.stop())
 
         // For file receiver:
         this.rtc.ondatachannel = event => {
@@ -255,15 +278,16 @@ class Connection {
           }
     }
 
-    handleCandidate(data) {
+    handleCandidate(rtcDescriptor) {
+        // TODO - verify hxDesciptor here?
         let candidate;
         try {
             // TODO - review: it's possible for signal.candidate to be null? https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/addIceCandidate
             candidate = new RTCIceCandidate({
-                candidate: data.candidate.candidate,
-                sdpMid: data.id,
-                sdpMLineIndex: data.label
-            }) // TODO - May just do new RTCIceCandidate(data.candidate)
+                candidate: rtcDescriptor.candidate.candidate,
+                sdpMid: rtcDescriptor.id,
+                sdpMLineIndex: rtcDescriptor.label
+            }) // TODO - May just do new RTCIceCandidate(rtcDescriptor.candidate)
         } catch(err) {return}
 
         this.rtc.addIceCandidate(candidate)
@@ -273,18 +297,21 @@ class Connection {
         this.close()
     }
 
-    send(data) {
+    send(rtcDescriptor) {
+        let data = {hxDescriptor: Array.from(this.acceptedChannels), rtcDescriptor}
         relay(this.guid, data)
     }
 
     close() {
         this.rtc.getSenders().forEach(sender => this.rtc.removeTrack(sender))
         this.rtc.close()
+        this.stateReset()
         notifyClosed(this.guid)
         delete connections[this.guid]
     }
 }
 
+// TODO - implement "perfectNegotiation" design
 /**
  * Sends RTC 'offer' to given peer by GUID unless the given peer has already requested
  * a connection. In which case an RTC 'answer' is sent immediately - accepting the peer offer.
@@ -294,19 +321,22 @@ class Connection {
  */
 export async function connect(guid, statusCallback) {
     if (!isRelayConnected()) return statusCallback(STATUS.Error)
-    if (!hasConnection(guid)) connections[guid] = new Connection(guid, statusCallback)
 
-    // TODO - hasRequest system to be replaced with "perfectNegotiation" design
-    if (hasRequest(guid)) {
-        let offer = requests[guid]
+    let connection = getConnection(guid, statusCallback)
+    connection.statusCallback = statusCallback
+    // Calling connect() will only happen on a fresh connection so reset back to Chat only
+    connection.clearAcceptedChannels()
+    connection.acceptedChannels.add(CHANNEL_TYPE.Chat)
+
+    // Check if connection request already exists
+    if (hasRequest(guid, connection.acceptedChannels)) {
+        await connection.sendAnswer(requests[guid].rtcDescriptor)
         delete requests[guid]
-        connections[guid].statusCallback = statusCallback
-        await connections[guid].sendAnswer(offer)
     } else {
-        requested[guid] = new Set("chat") // TODO: enumerate // Push to requested
-        await connections[guid].sendOffer()
+        await connection.createChannel(CHANNEL_TYPE.Chat)
     }
-    return connections[guid].export
+
+    return connection.export
 }
 
 /**
@@ -314,17 +344,13 @@ export async function connect(guid, statusCallback) {
  * @param {{source: GUID, type: String, data: {*}}} message - From peer through relay server.
  */
 export function handleRelay(message) {
-    let target = message.source
-    if (!hasConnection(target)) {
-        connections[target] = new Connection(target)
-    }
-    message.type = message.data.type
-    let messageHandler = connections[target].messageHandler[message.type]
-    if (typeof messageHandler !== 'function') {
-        return
-    }
-    message.data.source = message.source
-    messageHandler(message.data)
+    let peer = message.source
+    let connection = getConnection(peer)
+
+    let messageHandler = connection.messageHandler[message.data.rtcDescriptor.type]
+    if (typeof messageHandler !== 'function') return
+
+    messageHandler(message.data.rtcDescriptor, new Set(message.data.hxDescriptor), peer)
 }
 
 let notifyRequest = guid => {}

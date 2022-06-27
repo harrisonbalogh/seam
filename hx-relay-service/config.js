@@ -11,7 +11,7 @@
 
 module.exports = {
     'database': 'mongodb://localhost/contentdb',
-    'domain': 'localhost',
+    'domain': 'hxdev.com',
     'protocol': 'http://',
     'clientName': 'HarxerWebClient',
     'projectStore': '/Users/harrisonbalogh/Developer/Servers/project_store',

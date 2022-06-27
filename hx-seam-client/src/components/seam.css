@@ -94,3 +94,8 @@ p {
     margin-left: 4px;
     width: 10px;
 }
+
+video {
+    height: 200px;
+    width: 200px;
+}
