@@ -16,19 +16,9 @@ export const STATUS = {
     Rejected: "REJECTED",
     Accepted: "ACCEPTED",
     Error: "ERROR",
-    StableChat: "CHAT_STABLE"
+    ChatOpen: "CHAT_OPEN",
+    ChatClosed: "CHAT_CLOSE"
 }
-const CONNECTION_STATE = {
-    Accepted: "ACCEPTED",
-    Requested: "REQUESTED",
-    Unset: "UNSET"
-}
-const CONNECTION_STATE_DEFAULT = {
-    chat: undefined,
-    call: undefined,
-    file: {}
-}
-
 export const CHANNEL_TYPE = {
     Chat: "CHAT",
     Call: "CALL",
@@ -39,14 +29,8 @@ export const CHANNEL_TYPE = {
  *    hxDescriptor - Set() of enumerated readable channels in SDP.
  *    rtcDescriptor - RTCSessionDescription for remote RTC description setter.
  */
-export const requests = { /** {guid: {hxDescriptor: Set, rtcDescriptor: RTCSessionDescription}} */ }
+const requests = { /** {guid: {hxDescriptor: Set, rtcDescriptor: RTCSessionDescription}} */ }
 export const hasRequest = (guid, descriptor) => requests[guid] && (descriptor === undefined || RTCHelper.eqSet(requests[guid].hxDescriptor, descriptor))
-/** Outgoing client connection-state requests. Map peer GUID to:
- *    hxDescriptor - Set() of enumerated readable channels in SDP.
- *    rtcDescriptor - RTCSessionDescription for local RTC description setter.
- */
-const requested = { /** {guid: {hxDescriptor: Set, rtcDescriptor: RTCSessionDescription}} */ }
-
 /** Maps RelayService GUIDs to Connection prototype objects */
 const connections = { /** {guid: Connection prototype} */ }
 /** Checks if the given connection type has been sent to a peer, by GUID. */
@@ -57,6 +41,9 @@ const getConnection = (guid, statusCallback = () => {}) => {
     connections[guid] = new Connection(guid, statusCallback)
     return connections[guid]
 }
+export const getPeers = () => Object.keys(connections).map(guid => connections[guid].export)
+export const getPeer = guid => connections[guid] && connections[guid].export
+export const getOpenPeers = () => getPeers().filter(peer => peer.isChatOpen()) // TODO include all streams?
 
 /**
  * Connection prototype. Holds RTC object, client GUID.
@@ -103,16 +90,27 @@ class Connection {
                 await this.createChannel(CHANNEL_TYPE.Call)
             },
             callEnd: _ => {
-                if (this.streams.call) this.streams.call.getTracks().forEach(track => track.stop())
+                this.acceptedChannels.delete(CHANNEL_TYPE.Call)
+                if (this.streams.callLocal) this.streams.callLocal.getTracks().forEach(track => track.stop())
+                this.streams.callLocal = undefined
+                if (this.streams.callRemote) this.streams.callRemote.getTracks().forEach(track => track.stop())
+                this.streams.callRemote = undefined
             },
             setHandleChatMessage: callback => this.messageHandler.chatMessage = callback,
-            isStable: _ => this.rtc.signalingState == "stable"
+            isChatOpen: () => this.channels.chat && this.channels.chat.readyState === "open",
+            isCallOpen: () => this.streams.callRemote && this.streams.callRemote.getTracks().some(track => track.readyState === "live"),
+            chatData: () => this.data.chat,
+            close: () => this.close()
         }
         this.channels = {
             chat: undefined
         }
         this.streams = {
-            call: undefined
+            callLocal: undefined,
+            callRemote: undefined
+        }
+        this.data = {
+            chat: []
         }
     }
 
@@ -121,25 +119,28 @@ class Connection {
             if (this.channels.chat) this.channels.chat.close()
 
             this.channels.chat = this.rtc.createDataChannel("chatChannel");
-            this.channels.chat.onopen = () => this.statusCallback(STATUS.StableChat)
-            this.channels.chat.onclose = () => {}
+            this.channels.chat.onopen = () => this.statusCallback(STATUS.ChatOpen)
+            this.channels.chat.onclose = () => {
+                this.channels.chat = undefined
+                this.statusCallback(STATUS.ChatClosed)
+            }
             this.channels.chat.onmessage = m => this.messageHandler.chatMessage(m.data);
             this.export.chatMessage = m => this.channels.chat.send(m)
 
             this.acceptedChannels.add(CHANNEL_TYPE.Chat)
         } else
         if (type == CHANNEL_TYPE.Call) {
-            if (this.streams.call) this.streams.call.getTracks().forEach(track => track.stop())
+            if (this.streams.callLocal) this.streams.callLocal.getTracks().forEach(track => track.stop())
 
-            this.streams.call = await navigator.mediaDevices.getUserMedia({
+            this.streams.callLocal = await navigator.mediaDevices.getUserMedia({
                 audio: true,
                 video: true
             })
-
-            this.streams.call.getTracks().forEach(track => {
-                this.rtc.addTrack(track, this.streams.call)
+            this.streams.callLocal.getTracks().forEach(track => {
+                this.rtc.addTrack(track, this.streams.callLocal)
             })
             this.rtc.ontrack = track => {
+                this.streams.callRemote = track.streams[0]
                 this.messageHandler.callTrack(track.streams[0])
             }
             this.acceptedChannels.add(CHANNEL_TYPE.Call)
@@ -158,9 +159,12 @@ class Connection {
         if (this.acceptedChannels.has(CHANNEL_TYPE.Chat)) {
             this.rtc.ondatachannel = evt => {
                 if (evt.channel.label != "chatChannel") return
-
-                evt.channel.onopen = () => this.statusCallback(STATUS.StableChat)
-                evt.channel.onclose = () => {}
+                this.channels.chat = evt.channel
+                evt.channel.onopen = () => this.statusCallback(STATUS.ChatOpen)
+                evt.channel.onclose = () => {
+                    this.channels.chat = undefined
+                    this.statusCallback(STATUS.ChatClosed)
+                }
                 evt.channel.onmessage = m => this.messageHandler.chatMessage(m.data);
                 this.export.chatMessage = m => evt.channel.send(m)
             }
@@ -180,6 +184,9 @@ class Connection {
     async handleOffer(rtcDescriptor, hxDescriptor, peer) {
         // Check if this offer type is already approved
         if (RTCHelper.eqSet(this.acceptedChannels, hxDescriptor)) {
+            await this.sendAnswer(rtcDescriptor)
+        } else if (this.acceptedChannels.has(CHANNEL_TYPE.Chat) && RTCHelper.eqSet(hxDescriptor, new Set([CHANNEL_TYPE.Chat]))) {
+            // TODO Notify of connection downgrade?
             await this.sendAnswer(rtcDescriptor)
         } else {
             requests[peer] = {hxDescriptor, rtcDescriptor}
@@ -303,11 +310,13 @@ class Connection {
     }
 
     close() {
-        this.rtc.getSenders().forEach(sender => this.rtc.removeTrack(sender))
+        this.export.callEnd()
+        if (this.channels.chat) this.channels.chat.close()
+        // TODO onremovetrack
+        // TODO rtc.removetrack
         this.rtc.close()
-        this.stateReset()
-        notifyClosed(this.guid)
         delete connections[this.guid]
+        notifyClosed(this.guid)
     }
 }
 

@@ -17,19 +17,19 @@ export function initRtc(connection) {
     })
   }
   rtc.oniceconnectionstatechange = _ => {
-      switch(rtc.iceConnectionState) {
-          case "closed":
-          case "failed":
-          case "disconnected":
-            connection.close()
-            break
-        }
+    switch(rtc.iceConnectionState) {
+      case "closed":
+      case "failed":
+      case "disconnected":
+        connection.handleClosed()
+        break
+    }
   }
   rtc.onicegatheringstatechange = _ => {}
   rtc.onsignalingstatechange = () => {
       switch(rtc.signalingState) {
           case "closed":
-            connection.close()
+            connection.handleClosed()
             break
         }
   }

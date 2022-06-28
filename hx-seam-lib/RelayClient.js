@@ -12,10 +12,13 @@ let serverSocket;
 let guid;
 /** Timer for keeping socket connection alive. */
 let pulseTimer;
+/** Track peers */
+let peers = new Set()
+export const getPeers = () => Array.from(peers)
 
 const supportsRtc = _ => ("RTCPeerConnection" in window)
 const supportsWebSocket = _ => ("WebSocket" in window)
-const socketOpen = _ => (serverSocket.readyState === serverSocket.OPEN)
+const socketOpen = _ => (serverSocket && serverSocket.readyState === serverSocket.OPEN)
 
 export const SEND_TYPE = {
     Deny: 'deny',
@@ -63,6 +66,8 @@ export function connect(onConnect, onError = () => {}) {
         throw new Error("WebSocket not supported.")
     }
 
+    if (serverSocket) disconnect()
+
     serverSocket = new WebSocket(RELAY_SERVER_URL) // Can pass in 'json' as 2nd arg for auto parsing?
 
     notify.connect = onConnect
@@ -76,10 +81,10 @@ export function connect(onConnect, onError = () => {}) {
 
 /** Closes the socket connection to the relay server. */
 export function disconnect() {
-    serverSocket.close()
+    if (serverSocket) serverSocket.close()
     serverSocket = undefined
     guid = undefined
-    // TODO - Validate handlerOnClose is called from serverSocket.close()
+    peers = new Set()
 }
 
 /** Relay data to a target peer by GUID through the relay server socket. */
@@ -141,20 +146,21 @@ const MESSAGE_HANDLERS = {
 
 /** Handles 'available' message. Notifies 'available' listener. */
 function handlerOnAvailable(msg) {
+    peers.add(msg.source)
     notify.available(msg.source)
 }
 /**
- * Handles 'connection' message. Stores client guid. Notifies 'available'
- * listener for each connected peer. Notifies 'connection' listener.
+ * Handles 'connection' message. Stores client guid. Notifies 'connection' listener.
  * */
 function handlerOnConnection(msg) {
     guid = msg.guid
-    msg.clients.forEach(client => handlerOnAvailable({source: client}))
-    notify.connect(guid)
+    msg.clients.forEach(client => peers.add(client))
+    notify.connect(guid, msg.clients)
 }
 
 /** Handles 'exit' message. Notifies 'exit' listener. */
 function handlerOnExit(msg) {
+    peers.delete(msg.source)
     notify.exit(msg.source)
 }
 
