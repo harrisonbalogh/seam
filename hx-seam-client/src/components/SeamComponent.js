@@ -15,57 +15,50 @@ class SeamComponent extends React.Component {
 
     this.state = {
       loggedIn: false,
-      guid: null,
-      peers: [], // RelayService peer GUIDs
-      connections: [], // Connection objects
+      guid: undefined,
       selectedPeer: undefined,
+      peers: [],
       videoStreamLocal: undefined,
-      videoStreamRemote: undefined,
-      chatMsgs: []
+      videoStreamRemote: undefined
     }
   }
 
   componentDidMount() {
     validateSession().then(_ => this.handleLogin()).catch(_ => {})
+    if (this.latestChatMsg) {
+      this.latestChatMsg.scrollIntoView() // TODO immediate
+    }
+  }
+
+  componentDidUpdate() {
+    if (this.latestChatMsg) {
+      this.latestChatMsg.scrollIntoView({ behavior: "smooth" })
+    }
   }
 
   handleLogin() {
     this.setState({loggedIn: true})
   }
 
-  signalServerConnect() {
-    // Disconnect existing connection
-    if (this.state.guid) {
-      RelayClient.disconnect()
-    }
-
-    RelayClient.setHandleRelay(Seam.handleRelay)
-    RelayClient.setNotifyAvailable((guid) => this.setState({peers: this.state.peers.concat([guid])}))
-    RelayClient.setNotifyExit((guid) => {
-      for (let p = 0; p < this.state.peers.length; p++) {
-        if (this.state.peers[p] === guid) {
-          this.setState({
-            peers: this.state.peers.slice(0, p).concat(this.state.peers.slice(p + 1)),
-            selectedPeer: guid === this.state.selectedPeer ? null : this.state.selectedPeer
-          })
-          break
-        }
-      }
-    })
-    RelayClient.setNotifyClose(_ => this.setState({guid: null, peers: []}))
-    RelayClient.connect(guid => this.setState({guid: guid}))
-
-    Seam.setNotifyRequest(() => {
-      this.forceUpdate()
-    })
-    Seam.setNotifyClosed(() => {
-        // TODO Close RTC screen.
-        this.forceUpdate()
-    })
+  setupRelayClient() {
+    RelayClient.setNotifyAvailable(() => this.generatePeerList()) // Relay peer joined
+    RelayClient.setNotifyExit(() => this.generatePeerList()) // Relay peer exited
+    RelayClient.setNotifyClose(() => this.generatePeerList()) // Relay client connection lost
   }
-  signalServerDisconnect() {
-    RelayClient.disconnect()
-    this.setState({guid: undefined})
+
+  setupSeam() {
+    RelayClient.setHandleRelay(Seam.handleRelay) // Required attach relay to seam
+    Seam.setNotifyRequest(() => this.forceUpdate()) // New Offer
+    Seam.setNotifyClosed(() => this.generatePeerList()) // Closed RTC
+  }
+
+  relayConnect() {
+    this.setupRelayClient()
+    this.setupSeam()
+    RelayClient.connect((guid, _) => {
+      this.generatePeerList()
+      this.setState({guid: guid})
+    })
   }
 
   async seamConnect(guid) {
@@ -74,23 +67,48 @@ class SeamComponent extends React.Component {
       if (status === CONNECTION_STATUS.Requested) {
           // Update UI with spinner
       } else if (status === CONNECTION_STATUS.Accepted) {
-          // Update UI connection chat
-      } else if (status === CONNECTION_STATUS.StableChat) {
+        if (this.videoStreamRemote && !seamConnection.isCallOpen()) {
+          this.setState({videoStreamRemote: undefined})
+        }
+        this.forceUpdate()
+      } else if (status === CONNECTION_STATUS.ChatOpen) {
+        this.forceUpdate()
+      } else if (status === CONNECTION_STATUS.ChatClosed) {
         this.forceUpdate()
       }
     })
     seamConnection.setHandleChatMessage(m => {
-      this.setState({chatMsgs: this.state.chatMsgs.concat([m])})
+      seamConnection.chatData().push({source: guid, message: m})
+      this.forceUpdate()
     })
-    this.setState({connections: this.state.connections.concat([seamConnection])})
+    this.generatePeerList()
   }
 
   getConnection(guid) {
-    return this.state.connections.find(c => c.guid() === guid)
+    return Seam.getPeer(guid)
+  }
+
+  /**
+   * Updates selectedPeer and list of interactable peers based on conditions:
+   * - If RelayServer is connected, all relay peers.
+   * - All stable connected seam peers that don't collide with added relay peers.
+   */
+  generatePeerList() {
+    let peers = new Set()
+    // Relay peers
+    if (RelayClient.isConnected()) {
+      RelayClient.getPeers().forEach(peer => peers.add(peer))
+    }
+    // Stable Seam connections
+    Seam.getOpenPeers().map(peer => peer.guid()).forEach(peer => peers.add(peer))
+    // Verify selectedPeer is still in list - else clear it
+    let selectedPeer = peers.has(this.state.selectedPeer) ? this.state.selectedPeer : undefined
+
+    this.setState({selectedPeer, peers: Array.from(peers)})
   }
 
   render() {
-    const { loggedIn, guid, peers, selectedPeer, chatMsgs } = this.state;
+    const { loggedIn, guid, selectedPeer, peers } = this.state;
 
     if (!loggedIn) {
       return <Login handleLogin={this.handleLogin}/>
@@ -99,13 +117,13 @@ class SeamComponent extends React.Component {
     const connection = this.getConnection(selectedPeer)
     const isChannelAccepted = type => connection && connection.acceptedChannels().has(type)
 
-    let msgList = () => {
-      return chatMsgs.map(msg => (
-        <li>{`${msg}`}</li>
-      ))
-    }
+    let msgList = () => connection.chatData().map(data => {
+      let className = data.source === guid ? "client" : "peer"
+      let source = data.source === guid ? "Me: " : "Peer: "
+      return <li ref={e => this.latestChatMsg = e} className={`chat-message-${className}`}><b>{source}</b>{data.message}</li>
+    })
 
-    let peerList = () => {
+    let peerList = (peers) => {
       if (peers.length === 0) return (
         <li style={{color: 'gray', textAlign: 'center'}}>
            <i> No peers connected...</i>
@@ -115,16 +133,16 @@ class SeamComponent extends React.Component {
         <li
           className={peer === selectedPeer ? 'selected' : ''}
           onClick={() => {
-            this.setState({selectedPeer: (selectedPeer === peer) ? null : peer})
+            this.setState({selectedPeer: (selectedPeer === peer) ? undefined : peer})
           }}
         >
-          {`${peer}`}{Seam.hasRequest(peer) ? <div className="notification"></div> : null}
+          {`${peer}`}{Seam.hasRequest(peer) ? <div className="notification"></div> : undefined}
         </li>
       )
     }
 
     let peerContainer = () => {
-      if (!guid) return null
+      if (!RelayClient.isConnected() && peers.length === 0) return undefined
 
       return (
         <div id="container-peers">
@@ -132,7 +150,7 @@ class SeamComponent extends React.Component {
             Peers:
           </p>
           <ul id="ul-peers">
-            {peerList()}
+            {peerList(peers)}
           </ul>
         </div>
       )
@@ -141,10 +159,17 @@ class SeamComponent extends React.Component {
     let connectButton = connected => {
       if (!connected)
         return <p className="button-style1" onClick={() => this.seamConnect(selectedPeer)}>Connect</p>
-      return <p className="button-style1 disabled">Connect</p>
+      return <p className="button-style1" onClick={() => connection.close()}>Disconnect</p>
     }
     let callButton = connected => {
       if (!connected) return
+
+      if (connection.isCallOpen() || isChannelAccepted(Seam.CHANNEL_TYPE.Call)) {
+        return <p className="button-style1" onClick={() => {
+          this.setState({videoStreamLocal: undefined, videoStreamRemote: undefined})
+          connection.callEnd()
+        }}>End Call</p>
+      }
 
       return (<p className="button-style1" onClick={() => {
         // Local Cam
@@ -164,7 +189,8 @@ class SeamComponent extends React.Component {
 
     let actionContainer = () => {
       if (selectedPeer === undefined) return
-      let connected = connection !== undefined && connection.isStable()
+      let connected = connection !== undefined && connection.isChatOpen()
+      let connectedCall = connection !== undefined && connection.isCallOpen()
 
       return (
         <div id="container-action">
@@ -175,45 +201,50 @@ class SeamComponent extends React.Component {
       )
     }
 
+    const onChatSendButton = () => {
+      if (this.chatInput.value.trim() === "") return
+      connection.chatMessage(this.chatInput.value.trim())
+      connection.chatData().push({source: guid, message: this.chatInput.value.trim()})
+      this.chatInput.value = ""
+      this.forceUpdate()
+    }
+    const handlePasswordKeyPress = e => {
+      if(e.key === 'Enter'){
+        onChatSendButton()
+      }
+    }
+
     let msgContainer = () => {
       if (!isChannelAccepted(Seam.CHANNEL_TYPE.Chat)) return
 
+      let inputField = connection.isChatOpen() ?
+        <input ref={element => this.chatInput = element} onKeyPress={handlePasswordKeyPress}></input> :
+        <input disabled className="disabled"></input>
+      let sendButton = connection.isChatOpen() ?
+        <p className="button-style1" onClick={onChatSendButton}>Send</p> :
+        <p className="button-style1 disabled">Send</p>
+
       return (
         <div id="container-chatMsgs">
-          <ul>
+          <ul ref={element => this.chatMsgContainer = element}>
             {msgList()}
           </ul>
-          <input ref={element => this.chatInput = element}></input>
-          <p className="button-style1" onClick={() => {
-            connection.chatMessage(this.chatInput.value)
-          } }>Send</p>
+          {inputField}
+          {sendButton}
         </div>
       )
     }
 
-    let videoContainerLocal = () => {
+    let videoContainer = () => {
       if (!isChannelAccepted(Seam.CHANNEL_TYPE.Call)) return
-      if (this.state.videoStreamLocal === undefined) return
 
       return (
         <div id="container-video">
-          <p>Video Local</p>
-          <video ref={vid => {
-            if (vid) vid.srcObject = this.state.videoStreamLocal
-          }} autoPlay />
-        </div>
-      )
-    }
-
-    let videoContainerRemote = () => {
-      if (!isChannelAccepted(Seam.CHANNEL_TYPE.Call)) return
-      if (this.state.videoStreamRemote === undefined) return
-
-      return (
-        <div id="container-video">
-          <p>Video Remote</p>
-          <video ref={vid => {
+          <video className="video-remote" ref={vid => {
             if (vid) vid.srcObject = this.state.videoStreamRemote
+          }} autoPlay />
+          <video className="video-local" ref={vid => {
+            if (vid) vid.srcObject = this.state.videoStreamLocal
           }} autoPlay />
         </div>
       )
@@ -228,13 +259,13 @@ class SeamComponent extends React.Component {
         <p>
           <b>Socket:</b> {`${guid}`}
         </p>
-        {!guid ? <p className="button-style1" onClick={() => this.signalServerConnect()}>Connect</p> : null}
-        {guid ? <p className="button-style1" onClick={() => this.signalServerDisconnect()}>Disconnect</p> : null}
+        {!RelayClient.isConnected() ? <p className="button-style1" onClick={() => this.relayConnect()}>Connect</p> : undefined}
+        {RelayClient.isConnected() ? <p className="button-style1" onClick={() => RelayClient.disconnect()}>Disconnect</p> : undefined}
+        {RelayClient.isConnected() ? <p className="button-style1" onClick={() => Seam.getPeers().forEach(connection => connection.close())}>Drop Peers</p> : undefined}
         {peerContainer()}
         {actionContainer()}
         {msgContainer()}
-        {videoContainerLocal()}
-        {videoContainerRemote()}
+        {videoContainer()}
       </div>
     )
   }

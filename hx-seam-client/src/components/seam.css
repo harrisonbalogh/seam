@@ -8,8 +8,8 @@ p {
     border-radius: 8px;
     display: inline-block;
     margin: 14px;
-    padding: 0 30px;
-    /* width: 300px; */
+    padding: 0 14px;
+    width: 286px;
 }
 
 .button-style1 {
@@ -35,6 +35,12 @@ p {
 
 .button-style1.disabled:hover {
     /* clears hover style */
+}
+
+input.disabled {
+    color: darkgray;
+    cursor: default;
+    background-color: lightgray;
 }
 
 #container-peers {
@@ -95,7 +101,56 @@ p {
     width: 10px;
 }
 
-video {
-    height: 200px;
-    width: 200px;
+#container-video {
+    background-color: black;
+    border: 1px solid black;
+    padding: 10px 0;
+    position: relative;
+    width: 286px;
+}
+
+#container-video .video-local {
+    box-shadow: 0 0 8px 0 black;
+    border: 0 solid black;
+    border-radius: 10px;
+    bottom: 10px;
+    overflow: hidden;
+    position: absolute;
+    right: 10px;
+    width: 60px;
+}
+
+#container-video .video-remote {
+    width: 100%;
+}
+
+#container-chatMsgs {
+    margin: 0;
+    padding: 0;
+    text-align: left;
+}
+
+#container-chatMsgs ul {
+    list-style: none;
+    margin: 0;
+    max-height: 100px;
+    overflow-y: auto;
+    padding: 0;
+    text-align: left;
+}
+
+#container-chatMsgs ul li {
+    display: block;
+    margin: 0;
+    padding: 0;
+    text-align: left;
+}
+
+#container-chatMsgs .chat-message-client {
+    color: rgb(66, 66, 66);
+    font-style: italic;
+}
+
+#container-chatMsgs .chat-message-peer {
+    color: black;
 }
