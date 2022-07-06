@@ -17,20 +17,43 @@ export const STATUS = {
     Accepted: "ACCEPTED",
     Error: "ERROR",
     ChatOpen: "CHAT_OPEN",
-    ChatClosed: "CHAT_CLOSE"
+    ChatClosed: "CHAT_CLOSE",
+    CallEnded: "CALL_ENDED",
+    FileOpen: "FILE_OPEN"
 }
 export const CHANNEL_TYPE = {
     Chat: "CHAT",
     Call: "CALL",
-    File: "FILE"
+    File: (fileName, size) => ["FILE",fileName,size].filter(Boolean).join('/')
 }
 
 /** Incoming peer connection-state requests. Map peer GUID to:
  *    hxDescriptor - Set() of enumerated readable channels in SDP.
  *    rtcDescriptor - RTCSessionDescription for remote RTC description setter.
+ *    file/<name>/<size> - Data channel for offered file transfer.
  */
 const requests = { /** {guid: {hxDescriptor: Set, rtcDescriptor: RTCSessionDescription}} */ }
-export const hasRequest = (guid, descriptor) => requests[guid] && (descriptor === undefined || RTCHelper.eqSet(requests[guid].hxDescriptor, descriptor))
+/**
+ * Sets requests[guid] to given data object, unless requests[guid] is already present, in which case
+ * the provided data merges/overwrites with existing data.
+ */
+const addRequest = (guid, data) => {
+    if (!hasRequest(guid)) requests[guid] = {}
+    Object.assign(requests[guid], data)
+}
+/** Gets request by GUID and optionally a request checks if one exists with the given descriptor filter. */
+export const hasRequest = (guid, descriptor) =>
+    requests[guid] &&
+    (descriptor === undefined || RTCHelper.eqSet(requests[guid].hxDescriptor, descriptor))
+/** Gets first file request from GUID. File name and size are optional. */
+export const getFileRequest = (guid, fileName, fileSize) => {
+    if (requests[guid] === undefined) return
+    for (let channel of requests[guid].hxDescriptor) {
+        if (channel.includes(CHANNEL_TYPE.File(fileName, fileSize))) {
+            return channel.split("/")
+        }
+    }
+}
 /** Maps RelayService GUIDs to Connection prototype objects */
 const connections = { /** {guid: Connection prototype} */ }
 /** Checks if the given connection type has been sent to a peer, by GUID. */
@@ -41,253 +64,244 @@ const getConnection = (guid, statusCallback = () => {}) => {
     connections[guid] = new Connection(guid, statusCallback)
     return connections[guid]
 }
-export const getPeers = () => Object.keys(connections).map(guid => connections[guid].export)
-export const getPeer = guid => connections[guid] && connections[guid].export
+export const getPeers = () => Object.keys(connections).map(guid => connections[guid].public())
+export const getPeer = guid => connections[guid] && connections[guid].public()
 export const getOpenPeers = () => getPeers().filter(peer => peer.isChatOpen()) // TODO include all streams?
 
+// TODO - implement "perfectNegotiation" design
 /**
- * Connection prototype. Holds RTC object, client GUID.
+ * Sends RTC 'offer' to given peer by GUID unless the given peer has already requested
+ * a connection. In which case an RTC 'answer' is sent immediately - accepting the peer offer.
+ * @param {*} guid - Peer GUID to send or accept an offer to or from.
+ * @param {*} statusCallback - Notifier for connection state changes.
+ * @returns Exported Connection functions.
+ */
+ export async function connect(guid, statusCallback) {
+    if (!isRelayConnected()) return statusCallback(STATUS.Error)
+
+    let connection = getConnection(guid, statusCallback)
+    connection.statusCallback = statusCallback
+    connection.clearAcceptedChannels()
+
+    await connection.chat.start()
+
+    return connection.public()
+}
+
+/**
+ * Connection prototype. Holds RTC object, peer client GUID.
 */
 class Connection {
     constructor(guid, statusCallback = () => {}) {
-
         /// What channel types this connection has approved
         this.acceptedChannels = new Set()
         this.clearAcceptedChannels = () => this.acceptedChannels = new Set()
 
-        /// Peer's latest protocol description offer (SDP)
-        this.offer = undefined
-
         /// WebRTC object with ICE callback suite setup
         this.rtc = RTCHelper.initRtc(this)
-        /// RelayService-assigned identifier
+        /// RelayService-assigned identifier of peer
         this.guid = guid
         /// For Connection reference holders event reactions. See `Seam.STATUS`
         this.statusCallback = statusCallback
 
-        this.messageHandler = {
-            'offer': (a, b, c) => this.handleOffer(a, b, c),
-            'answer': (a) => this.handleAnswer(a),
-            'candidate': (a) => this.handleCandidate(a),
-            'closed': () => this.handleClosed(),
-            chatMessage: () => {},
-            callTrack: () => {}
-        }
-
-        /** Functions exposed to Connection reference holders */
-        this.export = {
-            guid: () => this.guid,
-            fileShare: _ => {},
-            chatMessage: _ => {},
-            acceptedChannels: () => this.acceptedChannels,
-            callStart: async onCallTrack => {
-                this.messageHandler.callTrack = onCallTrack
-                this.acceptedChannels.add(CHANNEL_TYPE.Call)
+        this.chat = {
+            channel: undefined,
+            data: [],
+            notifyMessage: () => {},
+            start: async () => {
+                this.acceptedChannels.add(CHANNEL_TYPE.Chat)
                 // Check if connection request already exists
-                if (hasRequest(guid, this.acceptedChannels)) {
-                    delete requests[guid]
+                if (hasRequest(this.guid, this.acceptedChannels)) {
+                    await this.handleOffer(requests[guid].rtcDescriptor, requests[guid].hxDescriptor, this.guid)
+                    delete requests[this.guid]
+                } else {
+                    if (this.chat.channel) this.chat.channel.close()
+                    await this.chat.onDataChannel(this.rtc.createDataChannel(CHANNEL_TYPE.Chat))
                 }
-                await this.createChannel(CHANNEL_TYPE.Call)
             },
-            callEnd: _ => {
-                this.acceptedChannels.delete(CHANNEL_TYPE.Call)
-                if (this.streams.callLocal) this.streams.callLocal.getTracks().forEach(track => track.stop())
-                this.streams.callLocal = undefined
-                if (this.streams.callRemote) this.streams.callRemote.getTracks().forEach(track => track.stop())
-                this.streams.callRemote = undefined
+            end: () => {
+                if (this.chat.channel) this.chat.channel.close()
             },
-            setHandleChatMessage: callback => this.messageHandler.chatMessage = callback,
-            isChatOpen: () => this.channels.chat && this.channels.chat.readyState === "open",
-            isCallOpen: () => this.streams.callRemote && this.streams.callRemote.getTracks().some(track => track.readyState === "live"),
-            chatData: () => this.data.chat,
-            close: () => this.close()
-        }
-        this.channels = {
-            chat: undefined
-        }
-        this.streams = {
-            callLocal: undefined,
-            callRemote: undefined
-        }
-        this.data = {
-            chat: []
-        }
-    }
+            message: m => {
+                if (m.trim() === "" || this.chat.channel === undefined) return
+                this.chat.data.push({source: "self", message: m.trim()})
+                this.chat.channel.send(m.trim())
+            },
+            onDataChannel: channel => {
+                if (!this.acceptedChannels.has(channel.label) || channel.label !== CHANNEL_TYPE.Chat) return
 
-    async createChannel(type = CHANNEL_TYPE.Chat) {
-        if (type == CHANNEL_TYPE.Chat) {
-            if (this.channels.chat) this.channels.chat.close()
-
-            this.channels.chat = this.rtc.createDataChannel("chatChannel");
-            this.channels.chat.onopen = () => this.statusCallback(STATUS.ChatOpen)
-            this.channels.chat.onclose = () => {
-                this.channels.chat = undefined
-                this.statusCallback(STATUS.ChatClosed)
-            }
-            this.channels.chat.onmessage = m => this.messageHandler.chatMessage(m.data);
-            this.export.chatMessage = m => this.channels.chat.send(m)
-
-            this.acceptedChannels.add(CHANNEL_TYPE.Chat)
-        } else
-        if (type == CHANNEL_TYPE.Call) {
-            if (this.streams.callLocal) this.streams.callLocal.getTracks().forEach(track => track.stop())
-
-            this.streams.callLocal = await navigator.mediaDevices.getUserMedia({
-                audio: true,
-                video: true
-            })
-            this.streams.callLocal.getTracks().forEach(track => {
-                this.rtc.addTrack(track, this.streams.callLocal)
-            })
-            this.rtc.ontrack = track => {
-                this.streams.callRemote = track.streams[0]
-                this.messageHandler.callTrack(track.streams[0])
-            }
-            this.acceptedChannels.add(CHANNEL_TYPE.Call)
-        }
-    }
-
-    async sendOffer() {
-        const offer = await this.rtc.createOffer()
-        if (this.rtc.signalingState != "stable") return // Waits for next negotiation
-        await this.rtc.setLocalDescription(offer) // RTCSessionDescription has type built in (answer/offer)
-        this.send(this.rtc.localDescription)
-        this.statusCallback(STATUS.Requested)
-    }
-
-    async sendAnswer(descriptor) {
-        if (this.acceptedChannels.has(CHANNEL_TYPE.Chat)) {
-            this.rtc.ondatachannel = evt => {
-                if (evt.channel.label != "chatChannel") return
-                this.channels.chat = evt.channel
-                evt.channel.onopen = () => this.statusCallback(STATUS.ChatOpen)
-                evt.channel.onclose = () => {
-                    this.channels.chat = undefined
+                this.chat.channel = channel
+                this.chat.channel.onopen = () => this.statusCallback(STATUS.ChatOpen)
+                this.chat.channel.onclose = () => {
+                    this.chat.channel = undefined
                     this.statusCallback(STATUS.ChatClosed)
                 }
-                evt.channel.onmessage = m => this.messageHandler.chatMessage(m.data);
-                this.export.chatMessage = m => evt.channel.send(m)
-            }
-        }
-        if (this.acceptedChannels.has(CHANNEL_TYPE.Call)) {
-            this.rtc.ontrack = track => {
-                this.messageHandler.callTrack(track.streams[0])
-            }
+                this.chat.channel.onmessage = m => {
+                    this.chat.data.push({source: this.guid, message: m.data})
+                    this.chat.notifyMessage(m.data)
+                }
+            },
+            isOpen: () => this.chat.channel && this.chat.channel.readyState === "open",
         }
 
-        await this.rtc.setRemoteDescription(new RTCSessionDescription(descriptor))
-        await this.rtc.setLocalDescription(await this.rtc.createAnswer())
-        this.send(this.rtc.localDescription) // RTCSessionDescription has type built in (answer)
-        this.statusCallback(STATUS.Accepted)
+        this.call = {
+            streamRemote: undefined,
+            streamLocal: undefined,
+            start: async onCallTrack => {
+                this.rtc.ontrack = track => {
+                    this.call.streamRemote = track.streams[0]
+                    onCallTrack(track.streams[0])
+                    track.onended = () => {
+                        this.statusCallback(STATUS.CallEnded)
+                        this.call.end()
+                    }
+                    track.onmute = () => {} // TODO
+                    track.onunmute = () => {} // TODO
+                }
+                this.acceptedChannels.add(CHANNEL_TYPE.Call)
+                if (hasRequest(guid, this.acceptedChannels)) delete requests[guid]
+                if (this.call.streamLocal) this.call.streamLocal.getTracks().forEach(track => track.stop())
+
+                this.call.streamLocal = await navigator.mediaDevices.getUserMedia({
+                    audio: true,
+                    video: true
+                })
+                this.call.streamLocal.getTracks().forEach(track => {
+                    this.rtc.addTrack(track, this.call.streamLocal)
+                })
+            },
+            end: _ => {
+                this.rtc.ontrack = () => {}
+                this.acceptedChannels.delete(CHANNEL_TYPE.Call)
+                if (this.call.streamLocal) this.call.streamLocal.getTracks().forEach(track => track.stop())
+                this.call.streamLocal = undefined
+                if (this.call.streamRemote) this.call.streamRemote.getTracks().forEach(track => track.stop())
+                this.call.streamRemote = undefined
+            },
+            isOpen: () => this.call.streamRemote && this.call.streamRemote.getTracks().some(track => track.readyState === "live"),
+        }
+
+        this.file = {
+            channel: undefined,
+            data: undefined,
+            reader: undefined,
+            bytesRead: undefined,
+            fileAccepted: undefined,
+            readerHalt: false,
+            SEND_FLAG: "send",
+            offer: async (file) => {
+                this.file.data = file
+
+                this.file.channel = this.rtc.createDataChannel(CHANNEL_TYPE.File(file.name, file.size))
+                this.file.channel.binaryType = 'arraybuffer'
+                const BUFFER_THRESHOLD_LOW = 65535 // NYI
+                const CHUNK_BYTE_SIZE = 16384
+                const getFileChunk = offset => this.file.reader.readAsArrayBuffer(this.file.data.slice(offset, offset + CHUNK_BYTE_SIZE))
+                this.file.reader = new FileReader()
+                this.file.bytesRead = 0
+                this.file.reader.addEventListener("error", () => {})
+                this.file.reader.addEventListener("abort", () => {})
+                this.file.reader.addEventListener("load", e => {
+                    this.file.channel.send(e.target.result)
+                    this.file.bytesRead += e.target.result.byteLength
+                })
+                this.file.channel.onmessage = m => {
+                    if (m.data === this.file.SEND_FLAG) {
+                        getFileChunk(this.file.bytesRead) // Bytes are only sent on-demand to give FS API time to write
+                    }
+                }
+            },
+            accept: async (name, size) => {
+                let fileChannelName = CHANNEL_TYPE.File(name, size)
+                this.acceptedChannels.add(fileChannelName)
+                let fileRequest = getFileRequest(this.guid, name, size)
+                if (fileRequest === undefined) return // TODO - File request not found
+                let channel = requests[this.guid][`${fileChannelName}`]
+                const handle = await window.showSaveFilePicker({suggestedName: name})
+                this.file.fileAccepted = {name, size, buffer: 0, bufferBytes: 0, bytesReceived: 0, writable: await handle.createWritable()}
+                this.file.onDataChannel(channel)
+                delete requests[this.guid]
+            },
+            onDataChannel: channel => {
+                if (channel.label.split("/")[0] !== CHANNEL_TYPE.File()) return
+
+                if (!this.acceptedChannels.has(channel.label)) {
+                    // This channel type has not been accepted but negotiation finished
+                    let hxDescriptor = (requests[this.guid] && requests[this.guid].hxDescriptor) || new Set()
+                    hxDescriptor.add(channel.label)
+                    addRequest(this.guid, {hxDescriptor, [`${channel.label}`]: channel})
+                    notifyRequest(this.guid, hxDescriptor)
+                    return
+                }
+
+                // TODO this.channels.<file specific>
+                this.file.channel = channel
+                this.file.channel.onopen = () => this.statusCallback(STATUS.FileOpen)
+                this.file.channel.onmessage = async m => {
+                    await this.file.fileAccepted.writable.write({
+                        type: "write",
+                        position: this.file.fileAccepted.bytesReceived,
+                        data: m.data
+                    })
+                    this.file.fileAccepted.bytesReceived += m.data.byteLength
+
+                    if (this.file.fileAccepted.bytesReceived >= this.file.fileAccepted.size) {
+                        await this.file.fileAccepted.writable.close()
+                    } else {
+                        this.file.channel.send(this.file.SEND_FLAG)
+                    }
+                }
+                this.file.channel.send(this.file.SEND_FLAG)
+            },
+        }
     }
 
-    async handleOffer(rtcDescriptor, hxDescriptor, peer) {
+    /** Functions exposed to Connection reference holders */
+    public() {
+        return {
+            setChatNotifyMessage: callback => this.chat.notifyMessage = callback,
+            isChatOpen: () => this.chat.isOpen(),
+            chatMessage: m => this.chat.message(m),
+            chatData: () => this.chat.data,
+
+            isCallOpen: () => this.call.isOpen(),
+            callStart: callback => this.call.start(callback),
+            callEnd: () => this.call.end(),
+
+            fileOffer: file => this.file.offer(file),
+            fileAccept: (name, size) => this.file.accept(name, size),
+
+            acceptedChannels: () => this.acceptedChannels,
+            guid: () => this.guid,
+            close: () => this.close()
+        }
+    }
+
+    /** Handle offer relay message. Add to request or auto-approve. */
+    async handleOffer(rtcDescriptor, hxDescriptor) {
         // Check if this offer type is already approved
         if (RTCHelper.eqSet(this.acceptedChannels, hxDescriptor)) {
-            await this.sendAnswer(rtcDescriptor)
-        } else if (this.acceptedChannels.has(CHANNEL_TYPE.Chat) && RTCHelper.eqSet(hxDescriptor, new Set([CHANNEL_TYPE.Chat]))) {
-            // TODO Notify of connection downgrade?
-            await this.sendAnswer(rtcDescriptor)
+            await this.rtc.setRemoteDescription(new RTCSessionDescription(rtcDescriptor))
+            await this.sendAnswer()
+
+        // if (this.acceptedChannels.has(CHANNEL_TYPE.Chat) && RTCHelper.eqSet(hxDescriptor, new Set([CHANNEL_TYPE.Chat]))) {
+        // TODO Connection downgrade? Notify? await this.sendAnswer()
         } else {
-            requests[peer] = {hxDescriptor, rtcDescriptor}
-            notifyRequest(peer, hxDescriptor)
+            addRequest(this.guid, {hxDescriptor, rtcDescriptor})
+            notifyRequest(this.guid, hxDescriptor)
         }
     }
 
+    /** Set remote descriptor with received answer packet. */
     handleAnswer(rtcDescriptor) {
         // TODO - verify hxDesciptor here?
         this.rtc.setRemoteDescription(new RTCSessionDescription(rtcDescriptor))
-
-        return
-
-        // For file receiver:
-        this.rtc.ondatachannel = event => {
-			dataChannel = event.channel;
-			dataChannel.binaryType = "arraybuffer";
-
-            dataChannel.onopen = () => {
-                let fileReader = new FileReader();
-                fileOffset = 0;
-                fileStartTime = new Date();
-                fileReader.addEventListener("error", err => console.error("Error reading file:", err));
-                fileReader.addEventListener("abort", evt => console.log("File reading aborted:", evt));
-                fileReader.addEventListener("load", async e => {
-                    dataChannel.send(e.target.result);
-                    let progress = `${roundTo(((fileOffset/fileSelected.size)*100), 2)}% sent.`
-                    fileOffset += e.target.result.byteLength;
-                    if (dataChannel.bufferedAmount < 65535) {
-                        if (fileOffset < fileSelected.size) {
-                            fileReader.readAsArrayBuffer(fileSelected.slice(fileOffset, fileOffset + 16384))
-                        } else {
-                            if (fileSelectedQueue.length > 0) {
-                                fileOffset = 0;
-                                let next = fileSelectedQueue[0];
-                                fileSelectedQueue.splice(0,1);
-                                setFileSelected(next);
-                            }
-                            console.log("File transfer completion time: " + ((new Date() - fileStartTime)/1000) + " seconds");
-
-                        }
-                    }
-                });
-                fileLabel.innerHTML = "Sending";
-                fileReader.readAsArrayBuffer(fileSelected.slice(fileOffset, 16384))
-            }
-
-            dataChannel.onclose = () => {}
-		};
-
-        // For file requester:
-        this.rtc.ondatachannel = event => {
-			dataChannel = event.channel;
-			dataChannel.binaryType = "arraybuffer";
-            dataChannel.bufferedAmountLowThreshold = 65535;
-            dataChannel.onbufferedamountlow = () => fileReader.readAsArrayBuffer(fileSelected.slice(fileOffset, fileOffset + 16384));
-		};
-        dataChannel.onmessage = function(event) {
-            fileInboundBuffer.push(event.data);
-            fileInboundSize += event.data.byteLength;
-
-            // receiveProgress.value = receivedSize; clip: rect(0, 0, 38px, 0);
-              let ratio = (fileInboundSize/fileReceiveSize);
-              fileProgressReceive.style.clip = "rect(0, "+(280*ratio)+"px, 38px, 0)"
-              fileInboundLabel.innerHTML = roundTo(ratio*100, 2)+"% received.";
-
-            // we are assuming that our signaling protocol told
-            // about the expected file size (and name, hash, etc).
-            if (fileInboundSize === fileReceiveSize) {
-              const received = new Blob(fileInboundBuffer);
-              fileInboundBuffer = [];
-                  fileInboundSize = 0;
-
-                  actionContainers[ACTION_FILE].style.height = "38px";
-
-                  let url = URL.createObjectURL(received);
-                  let a = document.createElement("a");
-                  a.style.display = "none";
-                  document.body.appendChild(a);
-                  a.href = url;
-                  a.download = fileReceiveName;
-                  fileReceiveName = "";
-                  a.click();
-                  URL.revokeObjectURL(url);
-                  document.body.removeChild(a);
-
-                  if (fileReceieveQueue == 0) {
-                      console.log("Finished queue.");
-                      dataChannel.close();
-                  } else {
-                      console.log("Awaiting next queue item...");
-                      sendWebRTCSignal({type: "meta"});
-                  }
-            }
-
-          }
     }
 
+    /** Add ICE candidates from received candidate packets. */
     handleCandidate(rtcDescriptor) {
         // TODO - verify hxDesciptor here?
-        let candidate;
+        let candidate = undefined
         try {
             // TODO - review: it's possible for signal.candidate to be null? https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/addIceCandidate
             candidate = new RTCIceCandidate({
@@ -300,18 +314,36 @@ class Connection {
         this.rtc.addIceCandidate(candidate)
     }
 
+    /** Handle peer closing connection - perform close-down actions. */
     handleClosed() {
         this.close()
     }
 
+    /** Create RTC offer packet and send to peer. */
+    async sendOffer() {
+        if (this.rtc.signalingState != "stable") return // Waits for next negotiation
+        await this.rtc.setLocalDescription(await this.rtc.createOffer()) // RTCSessionDescription has type built in (answer/offer)
+        this.send(this.rtc.localDescription)
+        this.statusCallback(STATUS.Requested)
+    }
+
+    /** Create RTC answer packet and send to peer. */
+    async sendAnswer() {
+        await this.rtc.setLocalDescription(await this.rtc.createAnswer())
+        this.send(this.rtc.localDescription) // RTCSessionDescription has type built in (answer)
+        this.statusCallback(STATUS.Accepted)
+    }
+
+    /** Pass packet to peer through a RelayClient. */
     send(rtcDescriptor) {
         let data = {hxDescriptor: Array.from(this.acceptedChannels), rtcDescriptor}
         relay(this.guid, data)
     }
 
+    /** Close down all RTC channels/tracks. */
     close() {
-        this.export.callEnd()
-        if (this.channels.chat) this.channels.chat.close()
+        this.call.end()
+        this.chat.end()
         // TODO onremovetrack
         // TODO rtc.removetrack
         this.rtc.close()
@@ -320,46 +352,24 @@ class Connection {
     }
 }
 
-// TODO - implement "perfectNegotiation" design
 /**
- * Sends RTC 'offer' to given peer by GUID unless the given peer has already requested
- * a connection. In which case an RTC 'answer' is sent immediately - accepting the peer offer.
- * @param {*} guid - Peer GUID to send or accept an offer to or from.
- * @param {*} statusCallback - Notifier for connection state changes.
- * @returns Exported Connection functions.
- */
-export async function connect(guid, statusCallback) {
-    if (!isRelayConnected()) return statusCallback(STATUS.Error)
-
-    let connection = getConnection(guid, statusCallback)
-    connection.statusCallback = statusCallback
-    // Calling connect() will only happen on a fresh connection so reset back to Chat only
-    connection.clearAcceptedChannels()
-    connection.acceptedChannels.add(CHANNEL_TYPE.Chat)
-
-    // Check if connection request already exists
-    if (hasRequest(guid, connection.acceptedChannels)) {
-        await connection.sendAnswer(requests[guid].rtcDescriptor)
-        delete requests[guid]
-    } else {
-        await connection.createChannel(CHANNEL_TYPE.Chat)
-    }
-
-    return connection.export
-}
-
-/**
- * Handle Relay server relay messages from peers.
+ * Handle Relay server relay messages from peers. Should come from a RelayClient.
  * @param {{source: GUID, type: String, data: {*}}} message - From peer through relay server.
  */
 export function handleRelay(message) {
     let peer = message.source
     let connection = getConnection(peer)
 
-    let messageHandler = connection.messageHandler[message.data.rtcDescriptor.type]
-    if (typeof messageHandler !== 'function') return
+    const relayHandlers = {
+        'offer': (a, b) => connection.handleOffer(a, b),
+        'answer': a => connection.handleAnswer(a),
+        'candidate': a => connection.handleCandidate(a),
+        'closed': () => connection.handleClosed()
+    }
 
-    messageHandler(message.data.rtcDescriptor, new Set(message.data.hxDescriptor), peer)
+    let handler = relayHandlers[message.data.rtcDescriptor.type]
+    if (typeof handler !== 'function') return
+    handler(message.data.rtcDescriptor, new Set(message.data.hxDescriptor))
 }
 
 let notifyRequest = guid => {}

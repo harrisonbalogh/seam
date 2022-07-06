@@ -37,12 +37,15 @@ export function initRtc(connection) {
       connection.sendOffer()
   }
 
+  rtc.addEventListener('datachannel', evt => connection.chat.onDataChannel(evt.channel))
+  rtc.addEventListener('datachannel', evt => connection.file.onDataChannel(evt.channel))
+
   return rtc
 }
 
 /** Set equality checker */
 export function eqSet(as, bs) {
-  if (as.size !== bs.size) return false;
+  if (as === undefined || bs === undefined || as.size !== bs.size) return false
   for (var a of as) if (!bs.has(a)) return false;
   return true;
 }
