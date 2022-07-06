@@ -79,7 +79,6 @@ class SeamComponent extends React.Component {
       } else if (status === CONNECTION_STATUS.ChatClosed) {
         this.forceUpdate()
       } else if (status === CONNECTION_STATUS.FileOpen) {
-        console.log("UI - Got file open status")
         this.forceUpdate()
       }
     })
@@ -211,7 +210,6 @@ class SeamComponent extends React.Component {
       let fileName =  (fileRequest.length > 1) ? fileRequest[1] : ""
       let fileSize =  (fileRequest.length > 2) ? fileRequest[2] : ""
       return <p id="btn-logout" className="button-style1" onClick={() => {
-        console.log(`UI - File accepted.`)
         connection.fileAccept(fileName, fileSize).then(_ => this.forceUpdate())
       }}><BsArrowBarDown />{`${fileName} (${fileSize})`}</p>
     }

@@ -34,7 +34,6 @@ class Login extends React.Component {
     login(user, pwd).then(_ => {
       this.props.handleLogin()
     }).catch(err => {
-      console.log(`Bad login: ${err}`)
       this.setState({loggingIn: false})
     })
   }
