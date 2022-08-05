@@ -2,5 +2,5 @@
   "name": "@harxer/seam-lib",
   "version": "0.1.0",
   "main": "Constants.js",
-  "repository": "git://github.com:harrisonbalogh/seam.git"
+  "repository": "git://github.com:harxer/seam.git"
 }
