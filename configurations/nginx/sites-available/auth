@@ -1,6 +1,4 @@
 location /api/ {
-    access_log /usr/local/etc/nginx/api-access.log simplified;
-
     proxy_set_header Access-Control-Allow-Origin *;
     proxy_set_header 'Access-Control-Allow-Methods' 'GET, POST, OPTIONS, PUT, DELETE';
     proxy_set_header 'Access-Control-Allow-Headers' 'X-Requested-With,Accept,Content-Type, Origin';
