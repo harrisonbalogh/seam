@@ -7,7 +7,8 @@ import { BsFillShieldLockFill, BsArrowUpRight, BsArrowDownLeft,
   BsFillTelephonePlusFill, BsFillTelephoneXFill, BsFolderPlus, BsForwardFill, BsForward,
   BsArrowBarUp, BsArrowBarDown, BsChevronDoubleDown } from "react-icons/bs";
 
-import { validateSession, invalidateSession } from 'hx-session-manager/HXSessionManager';
+import { AUTH_DOMAIN } from '@harxer/seam-lib';
+import { validateSession, invalidateSession } from '@harxer/session-manager-lib';
 import Login from './Login';
 
 class SeamComponent extends React.Component {
@@ -27,7 +28,7 @@ class SeamComponent extends React.Component {
   }
 
   componentDidMount() {
-    validateSession().then(_ => this.handleLogin()).catch(_ => {})
+    validateSession(AUTH_DOMAIN).then(_ => this.handleLogin()).catch(_ => {})
     if (this.latestChatMsg) {
       this.latestChatMsg.scrollIntoView() // TODO immediate
     }
@@ -299,7 +300,7 @@ class SeamComponent extends React.Component {
 
     return (
       <div className="container">
-        <p id="btn-logout" className="button-style1" onClick={() => invalidateSession().then(_ => window.location.reload())}>Logout <BsFillShieldLockFill/></p>
+        <p id="btn-logout" className="button-style1" onClick={() => invalidateSession(AUTH_DOMAIN).then(_ => window.location.reload())}>Logout <BsFillShieldLockFill/></p>
         <div>
           <b>ID:</b> {guidLabel()}
           {!RelayClient.isConnected() ? <div className="button-styleIcon" onClick={() => this.relayConnect()}><BsArrowBarUp /></div> : undefined}

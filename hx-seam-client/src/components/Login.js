@@ -1,6 +1,7 @@
 import React from 'react';
 import './login.css';
-import { login } from 'hx-session-manager/HXSessionManager';
+import { AUTH_DOMAIN } from '@harxer/seam-lib';
+import { login } from '@harxer/session-manager-lib';
 
 class Login extends React.Component {
 
@@ -31,7 +32,7 @@ class Login extends React.Component {
 
     this.setState({loggingIn: true})
 
-    login(user, pwd).then(_ => {
+    login(AUTH_DOMAIN, user, pwd).then(_ => {
       this.props.handleLogin()
     }).catch(err => {
       this.setState({loggingIn: false})
